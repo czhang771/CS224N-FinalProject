@@ -5,7 +5,7 @@ import os
 import time
 from typing import Any
 
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -42,8 +42,8 @@ class GeminiJudge:
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY not set in environment or .env file")
-        genai.configure(api_key=api_key)
-        self.model = genai.GenerativeModel(model_name)
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = model_name
         self.max_retries = max_retries
 
     def judge(
@@ -63,7 +63,10 @@ class GeminiJudge:
         last_error: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                response = self.model.generate_content(prompt)
+                response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=prompt,
+                )
                 result = _parse_judge_response(response.text)
                 return result
             except Exception as e:

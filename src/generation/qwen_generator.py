@@ -40,10 +40,18 @@ class QwenGenerator:
         self.temperature = temperature
         self.do_sample = do_sample
 
+        # BFloat16 is unsupported on MPS (Apple Silicon); use float32 there.
+        if torch.cuda.is_available():
+            torch_dtype = "auto"
+        elif torch.backends.mps.is_available():
+            torch_dtype = torch.float32
+        else:
+            torch_dtype = torch.float32
+
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype="auto",
+            torch_dtype=torch_dtype,
             device_map="auto",
             trust_remote_code=True,
         )
