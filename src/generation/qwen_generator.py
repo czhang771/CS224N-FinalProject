@@ -51,7 +51,7 @@ class QwenGenerator:
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch_dtype,
+            dtype=torch_dtype,
             device_map="auto",
             trust_remote_code=True,
         )
