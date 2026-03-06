@@ -16,3 +16,7 @@ __pycache__/
 *.pyo
 .pytest_cache/
 .mypy_cache/
+
+# Data
+data/outputs/
+data/raw/
