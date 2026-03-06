@@ -41,12 +41,23 @@ class QwenGenerator:
         self.do_sample = do_sample
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype="auto",
-            device_map="auto",
-            trust_remote_code=True,
-        )
+
+        # CUDA: use auto + bfloat16. Mac/CPU: use CPU + float32 (avoids MPS bfloat16 + disk offload issues)
+        if torch.cuda.is_available():
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.bfloat16,
+                device_map="auto",
+                trust_remote_code=True,
+            )
+        else:
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_name,
+                torch_dtype=torch.float32,
+                device_map="cpu",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
         self.model.eval()
 
     def generate(self, question: str, context_text: str) -> dict[str, Any]:
@@ -63,12 +74,20 @@ class QwenGenerator:
         inputs = self.tokenizer(input_text, return_tensors="pt").to(self.model.device)
         input_len = inputs["input_ids"].shape[1]
 
+        from transformers import GenerationConfig
+
+        gen_config = GenerationConfig(
+            max_new_tokens=self.max_new_tokens,
+            temperature=self.temperature,
+            do_sample=self.do_sample,
+            top_p=0.8 if self.do_sample else 1.0,  # 1.0 = no nucleus filter for greedy
+            top_k=20 if self.do_sample else 0,    # 0 = no top-k for greedy
+        )
+
         with torch.no_grad():
             outputs = self.model.generate(
                 **inputs,
-                max_new_tokens=self.max_new_tokens,
-                temperature=self.temperature,
-                do_sample=self.do_sample,
+                generation_config=gen_config,
                 output_scores=True,
                 return_dict_in_generate=True,
             )

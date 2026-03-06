@@ -1,6 +1,6 @@
-# Core ML
+# Core ML (transformers<4.40 for PyTorch 2.2.x compatibility)
 torch>=2.1.0
-transformers>=4.40.0
+transformers>=4.36.0,<4.40.0
 accelerate>=0.27.0
 
 # Data

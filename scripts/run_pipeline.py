@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         type=str,
         default="Qwen/Qwen2.5-3B-Instruct",
-        help="Qwen model name or path",
+        help="Qwen model (use Qwen/Qwen2.5-0.5B-Instruct for faster CPU testing)",
     )
     return parser.parse_args()
 
