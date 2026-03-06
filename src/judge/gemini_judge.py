@@ -5,8 +5,8 @@ import os
 import time
 from typing import Any
 
-from google import genai
 from dotenv import load_dotenv
+from google import genai
 
 load_dotenv()
 
@@ -39,10 +39,17 @@ Respond with this exact JSON structure:
 
 class GeminiJudge:
     def __init__(self, model_name: str = "gemini-2.5-flash", max_retries: int = 3):
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY not set in environment or .env file")
-        self.client = genai.Client(api_key=api_key)
+        project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+
+        if not project:
+            raise ValueError("GOOGLE_CLOUD_PROJECT not set in environment")
+
+        self.client = genai.Client(
+            vertexai=True,
+            project=project,
+            location=location,
+        )
         self.model_name = model_name
         self.max_retries = max_retries
 
@@ -71,11 +78,12 @@ class GeminiJudge:
                 return result
             except Exception as e:
                 last_error = e
-                wait = 2 ** attempt
-                print(f"  [GeminiJudge] Attempt {attempt + 1} failed: {e}. Retrying in {wait}s...")
+                wait = 2**attempt
+                print(
+                    f"  [GeminiJudge] Attempt {attempt + 1} failed: {e}. Retrying in {wait}s..."
+                )
                 time.sleep(wait)
 
-        # All retries exhausted — return a sentinel
         print(f"  [GeminiJudge] All retries failed: {last_error}")
         return {
             "judge_label": "error",
@@ -86,19 +94,24 @@ class GeminiJudge:
 
 def _parse_judge_response(text: str) -> dict[str, Any]:
     """Parse and validate the JSON response from Gemini."""
-    # Strip markdown code fences if present
     text = text.strip()
+
     if text.startswith("```"):
         lines = text.split("\n")
-        text = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+        if len(lines) >= 2:
+            if lines[-1].strip() == "```":
+                text = "\n".join(lines[1:-1])
+            else:
+                text = "\n".join(lines[1:])
 
     data = json.loads(text)
 
-    label = data.get("hallucination_label", "").lower()
+    label = str(data.get("hallucination_label", "")).lower()
     if label not in ("hallucinated", "not_hallucinated"):
         raise ValueError(f"Unexpected hallucination_label: {label!r}")
 
     confidence = float(data.get("confidence", 0.0))
+    confidence = max(0.0, min(1.0, confidence))
     reasoning = str(data.get("reasoning", ""))
 
     return {

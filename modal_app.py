@@ -2,8 +2,8 @@
 Modal app for the hallucination detection pipeline.
 
 Usage:
-    # Store your Gemini API key as a Modal secret (one-time setup):
-    modal secret create gemini-secret GEMINI_API_KEY=<your-key>
+    # Store your Vertex service account JSON as a Modal secret (one-time setup):
+    modal secret create gcp-vertex-secret SERVICE_ACCOUNT_JSON="$(cat ~/Downloads/YOUR_SERVICE_ACCOUNT_KEY.json)"
 
     # Run the full pipeline (100 samples) on a GPU:
     modal run modal_app.py
@@ -59,7 +59,7 @@ app = modal.App("hallucination-pipeline", image=image)
 @app.function(
     gpu="A10G",
     timeout=7200,  # 2 hours — enough for 100 samples
-    secrets=[modal.Secret.from_name("gemini-secret")],
+    secrets=[modal.Secret.from_name("gcp-vertex-secret")],
     volumes={VOLUME_PATH: volume},
 )
 def run_pipeline(
@@ -69,8 +69,18 @@ def run_pipeline(
     model_name: str = "Qwen/Qwen2.5-3B-Instruct",
     skip_judge: bool = False,
 ):
+    import os
     import sys
+    from pathlib import Path
+
     sys.path.insert(0, "/root")
+
+    creds_path = Path("/tmp/gcp-vertex-secret.json")
+    creds_path.write_text(os.environ["SERVICE_ACCOUNT_JSON"])
+
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
+    os.environ["GOOGLE_CLOUD_PROJECT"] = "gen-lang-client-0685572539"
+    os.environ["GOOGLE_CLOUD_LOCATION"] = "us-central1"
 
     from tqdm import tqdm
 
