@@ -24,8 +24,12 @@ Generated Answer:
 {generated_answer}
 
 Instructions:
-- Judge ONLY context faithfulness: does the answer make claims not supported by the context?
-- Do NOT penalize for incomplete answers; only flag unsupported claims.
+- Judge ONLY context faithfulness: does the answer make claims not supported by the provided context?
+- Do NOT penalize for incomplete answers; only flag unsupported positive claims.
+- Do NOT flag reasonable conclusions or inferences that are directly implied by the context data, even if not stated word-for-word.
+- Do NOT flag standard scientific caveats (e.g. "further studies are needed") as hallucinations.
+- Do NOT flag paraphrasing or minor wording differences if the core meaning matches the context.
+- Only label "hallucinated" if a claim directly contradicts or has NO basis in the context.
 - Respond with valid JSON only, no additional text.
 
 Respond with this exact JSON structure:

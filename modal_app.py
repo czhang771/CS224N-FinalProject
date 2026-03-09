@@ -78,8 +78,11 @@ def run_pipeline(
     creds_path = Path("/tmp/gcp-vertex-secret.json")
     creds_path.write_text(os.environ["SERVICE_ACCOUNT_JSON"])
 
+    import json as _json
+    project_id = _json.loads(os.environ["SERVICE_ACCOUNT_JSON"]).get("project_id")
+
     os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
-    os.environ["GOOGLE_CLOUD_PROJECT"] = "gen-lang-client-0685572539"
+    os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
     os.environ["GOOGLE_CLOUD_LOCATION"] = "us-central1"
 
     from tqdm import tqdm
