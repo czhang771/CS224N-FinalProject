@@ -5,17 +5,14 @@ Usage:
     # Store your Vertex service account JSON as a Modal secret (one-time setup):
     modal secret create gcp-vertex-secret SERVICE_ACCOUNT_JSON="$(cat ~/Downloads/YOUR_SERVICE_ACCOUNT_KEY.json)"
 
-    # Small test (run first):
-    modal run modal_app.py --n-samples 5
+    # Generation only (no judge):
+    modal run modal_app.py --n-samples 8
 
-    # Medium test (run second):
-    modal run modal_app.py --n-samples 50
+    # Judge pass (run after generation):
+    modal run modal_app.py::judge
 
-    # Full run (only when both above look correct):
-    modal run modal_app.py --n-samples 1000
-
-    # Skip judge for generation-only testing:
-    modal run modal_app.py --n-samples 5 --skip-judge
+    # Skip judge during generation (same as default now):
+    modal run modal_app.py --n-samples 8
 
     # Download output after run:
     modal volume get pipeline-outputs pipeline_output.jsonl ./data/outputs/
@@ -26,32 +23,24 @@ import modal
 # ---------------------------------------------------------------------------
 # Image
 # ---------------------------------------------------------------------------
-# Use a CUDA base so transformers can use the GPU. Install deps explicitly
-# so Modal can cache the layer — avoid `pip_install_from_requirements` because
-# that busts the cache on every requirements.txt touch.
 image = (
     modal.Image.debian_slim(python_version="3.10")
     .pip_install(
-        # Core ML — on Modal we always have CUDA, so no upper bound needed
         "torch>=2.1.0",
         "transformers>=4.40.0,<5.0.0",
         "accelerate>=0.27.0",
-        # Data
         "datasets>=2.18.0",
-        # Judge
         "google-genai>=1.0.0",
-        # Utils
         "python-dotenv>=1.0.0",
         "tqdm>=4.66.0",
         "pyyaml>=6.0",
         "numpy>=1.24.0",
     )
-    # Copy local src/ into the image (replaces Mount in Modal 1.x)
     .add_local_dir("src", remote_path="/root/src")
 )
 
 # ---------------------------------------------------------------------------
-# Persistent volume — stores the JSONL output across runs
+# Persistent volume
 # ---------------------------------------------------------------------------
 volume = modal.Volume.from_name("pipeline-outputs", create_if_missing=True)
 VOLUME_PATH = "/outputs"
@@ -63,9 +52,12 @@ OUTPUT_FILENAME = "pipeline_output.jsonl"
 app = modal.App("hallucination-pipeline", image=image)
 
 
+# ---------------------------------------------------------------------------
+# Generation function (no judge)
+# ---------------------------------------------------------------------------
 @app.function(
     gpu="A10G",
-    timeout=14400,  # 4 hours — covers 1,000 samples with attention/hidden-state logging
+    timeout=14400,
     secrets=[modal.Secret.from_name("gcp-vertex-secret")],
     volumes={VOLUME_PATH: volume},
 )
@@ -74,9 +66,8 @@ def run_pipeline(
     seed: int = 42,
     max_new_tokens: int = 512,
     model_name: str = "Qwen/Qwen2.5-3B-Instruct",
-    skip_judge: bool = False,
+    batch_size: int = 4,
 ):
-    import os
     import sys
     import numpy as np
     import torch
@@ -84,21 +75,10 @@ def run_pipeline(
 
     sys.path.insert(0, "/root")
 
-    creds_path = Path("/tmp/gcp-vertex-secret.json")
-    creds_path.write_text(os.environ["SERVICE_ACCOUNT_JSON"])
-
-    import json as _json
-    project_id = _json.loads(os.environ["SERVICE_ACCOUNT_JSON"]).get("project_id")
-
-    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
-    os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
-    os.environ["GOOGLE_CLOUD_LOCATION"] = "us-central1"
-
     from tqdm import tqdm
 
     from src.data.load_pubmedqa import load_pubmedqa
     from src.generation.qwen_generator import QwenGenerator
-    from src.judge.gemini_judge import GeminiJudge
     from src.utils.io import append_jsonl, load_completed_pubids
 
     output_path = f"{VOLUME_PATH}/{OUTPUT_FILENAME}"
@@ -123,77 +103,143 @@ def run_pipeline(
     print(f"Loading Qwen generator: {model_name}")
     generator = QwenGenerator(model_name=model_name, max_new_tokens=max_new_tokens)
 
-    # --- Load Gemini judge ---
-    judge = None
-    if not skip_judge:
-        print("Initializing Gemini judge...")
-        judge = GeminiJudge()
+    # --- Run pipeline in batches ---
+    print(f"\nRunning generation on {len(remaining)} examples (batch_size={batch_size})...")
 
-    # --- Run pipeline ---
-    print(f"\nRunning pipeline on {len(remaining)} examples...")
-    for example in tqdm(remaining, desc="Pipeline"):
-        record = dict(example)
+    batches = [remaining[i:i + batch_size] for i in range(0, len(remaining), batch_size)]
 
-        # Generation
+    for batch in tqdm(batches, desc="Batches"):
+        pairs = [(ex["question"], ex["context_text"]) for ex in batch]
+
         try:
-            gen_result = generator.generate(
-                question=example["question"],
-                context_text=example["context_text"],
-            )
-            # Convert numpy arrays to lists for JSON serialization before storing
-            if isinstance(gen_result.get("attention_last_rows"), list):
-                gen_result["attention_last_rows"] = [
-                    a.tolist() if isinstance(a, np.ndarray) else a
-                    for a in gen_result["attention_last_rows"]
-                ]
-            if isinstance(gen_result.get("mean_pooled_hidden_states"), np.ndarray):
-                gen_result["mean_pooled_hidden_states"] = gen_result["mean_pooled_hidden_states"].tolist()
-            record.update(gen_result)
+            gen_results = generator.generate_batch(pairs)
         except Exception as e:
-            print(f"\n  [Generator] Error on pubid={example['pubid']}: {e}")
-            record.update({
-                "generated_answer": "",
-                "tokens": [],
-                "token_log_probs": [],
-                "top100_logit_values": [],
-                "top100_logit_token_ids": [],
-                "token_entropies": [],
-                "attention_last_rows": [],
-                "mean_pooled_hidden_states": [],
-                "context_start_idx": 0,
-                "context_end_idx": 0,
-                "input_len": 0,
-                "uncertainty_features": {},
-            })
+            print(f"\n  [Generator] Batch error: {e}. Falling back to per-example.")
+            gen_results = []
+            for ex in batch:
+                try:
+                    gen_results.append(generator.generate(ex["question"], ex["context_text"]))
+                except Exception as e2:
+                    print(f"\n  [Generator] Error on pubid={ex['pubid']}: {e2}")
+                    gen_results.append(_empty_gen_result())
 
-        # Free GPU memory after each example
+        for ex, gen_result in zip(batch, gen_results):
+            record = dict(ex)
+
+            # Serialize numpy arrays
+            if isinstance(gen_result.get("final_token_attention"), np.ndarray):
+                gen_result["final_token_attention"] = gen_result["final_token_attention"].tolist()
+            if isinstance(gen_result.get("middle_layer_hidden_state"), np.ndarray):
+                gen_result["middle_layer_hidden_state"] = gen_result["middle_layer_hidden_state"].tolist()
+
+            record.update(gen_result)
+
+            # Judge fields absent during generation pass
+            record["judge_label"] = None
+            record["judge_confidence"] = None
+            record["judge_reasoning"] = None
+
+            append_jsonl(record, output_path)
+            volume.commit()
+
         torch.cuda.empty_cache()
-
-        # Judge
-        if judge is not None and record.get("generated_answer"):
-            try:
-                record.update(
-                    judge.judge(
-                        question=example["question"],
-                        context_text=example["context_text"],
-                        generated_answer=record["generated_answer"],
-                    )
-                )
-            except Exception as e:
-                print(f"\n  [Judge] Error on pubid={example['pubid']}: {e}")
-                record.update({"judge_label": "error", "judge_confidence": 0.0, "judge_reasoning": str(e)})
-        elif not skip_judge:
-            record.update({"judge_label": "skipped_empty_answer", "judge_confidence": 0.0, "judge_reasoning": ""})
-
-        append_jsonl(record, output_path)
-        volume.commit()  # flush write to volume after each record
 
     print(f"\nDone. Output at: {output_path}")
     return output_path
 
 
+def _empty_gen_result() -> dict:
+    return {
+        "generated_answer": "",
+        "tokens": [],
+        "token_log_probs": [],
+        "top100_logit_values": [],
+        "top100_logit_token_ids": [],
+        "token_entropies": [],
+        "final_token_attention": [],
+        "middle_layer_hidden_state": [],
+        "context_start_idx": 0,
+        "context_end_idx": 0,
+        "input_len": 0,
+        "uncertainty_features": {},
+    }
+
+
 # ---------------------------------------------------------------------------
-# Local entrypoint — called when you run `modal run modal_app.py`
+# Judge function (separate pass)
+# ---------------------------------------------------------------------------
+@app.function(
+    timeout=7200,
+    secrets=[modal.Secret.from_name("gcp-vertex-secret")],
+    volumes={VOLUME_PATH: volume},
+)
+def run_judge():
+    import os
+    import json
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, "/root")
+
+    from src.judge.gemini_judge import GeminiJudge
+    from src.utils.io import append_jsonl
+
+    creds_path = Path("/tmp/gcp-vertex-secret.json")
+    creds_path.write_text(os.environ["SERVICE_ACCOUNT_JSON"])
+
+    project_id = json.loads(os.environ["SERVICE_ACCOUNT_JSON"]).get("project_id")
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = str(creds_path)
+    os.environ["GOOGLE_CLOUD_PROJECT"] = project_id
+    os.environ["GOOGLE_CLOUD_LOCATION"] = "us-central1"
+
+    output_path = f"{VOLUME_PATH}/{OUTPUT_FILENAME}"
+
+    volume.reload()
+    records = []
+    with open(output_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+
+    to_judge = [r for r in records if r.get("judge_label") is None and r.get("generated_answer")]
+    print(f"Found {len(records)} records, {len(to_judge)} need judging.")
+
+    if not to_judge:
+        print("Nothing to judge.")
+        return
+
+    judge = GeminiJudge()
+
+    for r in to_judge:
+        try:
+            result = judge.judge(
+                question=r["question"],
+                context_text=r["context_text"],
+                generated_answer=r["generated_answer"],
+            )
+            r.update(result)
+        except Exception as e:
+            print(f"  [Judge] Error on pubid={r.get('pubid')}: {e}")
+            r["judge_label"] = "error"
+            r["judge_confidence"] = 0.0
+            r["judge_reasoning"] = str(e)
+
+    # Rewrite the full file with updated records
+    tmp_path = output_path + ".tmp"
+    with open(tmp_path, "w") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+
+    import shutil
+    shutil.move(tmp_path, output_path)
+    volume.commit()
+
+    print(f"Done. Judged {len(to_judge)} records.")
+
+
+# ---------------------------------------------------------------------------
+# Local entrypoints
 # ---------------------------------------------------------------------------
 @app.local_entrypoint()
 def main(
@@ -201,16 +247,27 @@ def main(
     seed: int = 42,
     max_new_tokens: int = 512,
     model: str = "Qwen/Qwen2.5-3B-Instruct",
-    skip_judge: bool = False,
+    batch_size: int = 4,
 ):
-    print(f"Launching pipeline on Modal (n_samples={n_samples}, seed={seed}, gpu=A10G)...")
+    print(f"Launching generation on Modal (n_samples={n_samples}, seed={seed}, batch_size={batch_size}, gpu=A10G)...")
     output_path = run_pipeline.remote(
         n_samples=n_samples,
         seed=seed,
         max_new_tokens=max_new_tokens,
         model_name=model,
-        skip_judge=skip_judge,
+        batch_size=batch_size,
     )
-    print(f"\nPipeline complete. Output saved to Modal volume at: {output_path}")
+    print(f"\nGeneration complete. Output saved to Modal volume at: {output_path}")
+    print("To run judge pass:")
+    print("  modal run modal_app.py::judge")
+    print("To download:")
+    print(f"  modal volume get pipeline-outputs {OUTPUT_FILENAME} ./data/outputs/")
+
+
+@app.local_entrypoint()
+def judge():
+    print("Launching judge pass on Modal...")
+    run_judge.remote()
+    print("Judge pass complete.")
     print("To download:")
     print(f"  modal volume get pipeline-outputs {OUTPUT_FILENAME} ./data/outputs/")

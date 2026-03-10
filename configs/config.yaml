@@ -12,6 +12,7 @@ generation:
   max_new_tokens: 512
   temperature: 1.0
   do_sample: false
+  batch_size: 4
 
 output:
   dir: "data/outputs"

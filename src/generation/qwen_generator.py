@@ -42,8 +42,12 @@ class QwenGenerator:
         self.do_sample = do_sample
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+        # Left-pad so batched generation aligns generated tokens correctly
+        self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # CUDA: use auto + bfloat16. Mac/CPU: use CPU + float32 (avoids MPS bfloat16 + disk offload issues)
+        # CUDA: use auto + bfloat16. Mac/CPU: use CPU + float32
         if torch.cuda.is_available():
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name,
@@ -62,57 +66,80 @@ class QwenGenerator:
             )
         self.model.eval()
 
+    # ------------------------------------------------------------------
+    # Single-example interface (wraps batch for convenience)
+    # ------------------------------------------------------------------
     def generate(self, question: str, context_text: str) -> dict[str, Any]:
-        """
-        Generate an answer and extract token-level probability signals.
+        return self.generate_batch([(question, context_text)])[0]
 
-        Returns a dict with:
+    # ------------------------------------------------------------------
+    # Batched interface
+    # ------------------------------------------------------------------
+    def generate_batch(self, examples: list[tuple[str, str]]) -> list[dict[str, Any]]:
+        """
+        Generate answers for a batch of (question, context_text) pairs.
+
+        Returns a list of dicts (one per example), each containing:
             generated_answer, tokens, token_log_probs, top100_logit_values,
-            top100_logit_token_ids, token_entropies, attention_matrices,
-            mean_pooled_hidden_states, context_start_idx, context_end_idx,
+            top100_logit_token_ids, token_entropies, final_token_attention,
+            middle_layer_hidden_state, context_start_idx, context_end_idx,
             input_len, uncertainty_features
         """
-        messages = build_prompt(question, context_text)
-        input_text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(input_text, return_tensors="pt").to(self.model.device)
-        input_len = inputs["input_ids"].shape[1]
-
-        # --- Context token indices ---
-        # Locate the context_text character span within input_text, then
-        # count tokens for the prefix up to each boundary.
-        # add_special_tokens=False because apply_chat_template embeds special
-        # tokens (e.g. <|im_start|>) directly in the text string.
-        ctx_marker = "Context:\n"
-        ctx_marker_pos = input_text.find(ctx_marker)
-        if ctx_marker_pos == -1:
-            context_start_idx = 0
-            context_end_idx = 0
-        else:
-            context_start_char = ctx_marker_pos + len(ctx_marker)
-            context_end_char = context_start_char + len(context_text)
-            context_start_idx = len(
-                self.tokenizer(
-                    input_text[:context_start_char],
-                    add_special_tokens=False,
-                )["input_ids"]
-            )
-            context_end_idx = len(
-                self.tokenizer(
-                    input_text[:context_end_char],
-                    add_special_tokens=False,
-                )["input_ids"]
-            )
-
         from transformers import GenerationConfig
+
+        batch_size = len(examples)
+
+        # --- Build prompts and tokenize ---
+        input_texts = []
+        for question, context_text in examples:
+            messages = build_prompt(question, context_text)
+            input_texts.append(
+                self.tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+            )
+
+        inputs = self.tokenizer(
+            input_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=False,
+        ).to(self.model.device)
+
+        # input_len per example = number of real (non-padding) tokens
+        input_lens = inputs["attention_mask"].sum(dim=1).tolist()  # list of ints
+
+        # --- Context token indices (per example) ---
+        context_indices = []
+        for i, (question, context_text) in enumerate(examples):
+            input_text = input_texts[i]
+            ctx_marker = "Context:\n"
+            ctx_marker_pos = input_text.find(ctx_marker)
+            if ctx_marker_pos == -1:
+                context_indices.append((0, 0))
+            else:
+                context_start_char = ctx_marker_pos + len(ctx_marker)
+                context_end_char = context_start_char + len(context_text)
+                context_start_idx = len(
+                    self.tokenizer(
+                        input_text[:context_start_char],
+                        add_special_tokens=False,
+                    )["input_ids"]
+                )
+                context_end_idx = len(
+                    self.tokenizer(
+                        input_text[:context_end_char],
+                        add_special_tokens=False,
+                    )["input_ids"]
+                )
+                context_indices.append((context_start_idx, context_end_idx))
 
         gen_config = GenerationConfig(
             max_new_tokens=self.max_new_tokens,
             temperature=self.temperature,
             do_sample=self.do_sample,
-            top_p=0.8 if self.do_sample else 1.0,  # 1.0 = no nucleus filter for greedy
-            top_k=20 if self.do_sample else 0,      # 0 = no top-k for greedy
+            top_p=0.8 if self.do_sample else 1.0,
+            top_k=20 if self.do_sample else 0,
         )
 
         with torch.no_grad():
@@ -125,91 +152,107 @@ class QwenGenerator:
                 return_dict_in_generate=True,
             )
 
-        # Generated token ids (excluding the prompt)
-        generated_ids = outputs.sequences[0, input_len:]
-        tokens = self.tokenizer.convert_ids_to_tokens(generated_ids.tolist())
-        generated_answer = self.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        # outputs.sequences: (batch, prompt_len_padded + n_generated)
+        # The padded prompt length is inputs["input_ids"].shape[1]
+        padded_input_len = inputs["input_ids"].shape[1]
+
+        # --- Final token attention: last generation step, all layers ---
+        # outputs.attentions[-1]: tuple of 36 tensors, each (batch, n_heads, seq_len, seq_len)
+        # We take the last row ([-1] in seq dim) → (batch, n_heads, seq_len)
+        # Stack across layers → (36, batch, n_heads, seq_len), then split per example
+        final_step_attns = outputs.attentions[-1]  # tuple of 36
+        # Stack: (36, batch, 2, seq_len)
+        final_attn_stacked = np.stack(
+            [layer.cpu().float().numpy() for layer in final_step_attns], axis=0
+        )  # (36, batch, 2, seq_len, seq_len)
+        # Last row of each attention matrix → (36, batch, 2, seq_len)
+        final_attn_last_row = final_attn_stacked[:, :, :, -1, :]  # (36, batch, 2, seq_len)
+
+        # --- Middle layer hidden state: layer 18, last generation step ---
+        # outputs.hidden_states[-1]: tuple of 37 tensors, each (batch, seq_len, 2048)
+        # Take layer index 18, mean-pool over seq_len → (batch, 2048)
+        final_step_hs = outputs.hidden_states[-1]  # tuple of 37
+        middle_hs = final_step_hs[18]  # (batch, seq_len, 2048)
+        middle_hs_pooled = middle_hs.mean(dim=1).cpu().float().numpy()  # (batch, 2048)
 
         # --- Per-token signals from scores ---
-        # outputs.scores: tuple of n_generated, each (1, vocab_size) — raw logits
-        token_log_probs: list[float] = []
-        token_probs: list[float] = []
-        top1_probs: list[float] = []
-        token_entropies: list[float] = []
-        top100_logit_values: list[list[float]] = []
-        top100_logit_token_ids: list[list[int]] = []
+        # outputs.scores: tuple of n_generated, each (batch, vocab_size)
+        # We need to demux per example. Since all examples in the batch may have
+        # generated different numbers of tokens (padding stops at EOS), we track
+        # generated ids per example to know valid steps.
+        generated_ids_batch = outputs.sequences[:, padded_input_len:]  # (batch, n_gen)
 
-        for step_idx, logits in enumerate(outputs.scores):
-            logits_1d = logits[0]  # (vocab_size,)
-            probs = F.softmax(logits_1d, dim=-1)
-            token_id = generated_ids[step_idx].item()
-            selected_prob = probs[token_id].item()
-            top1_prob = probs.max().item()
+        # Build per-example lists of scores up to their EOS
+        # For simplicity we process scores for all steps and mask out post-EOS
+        eos_id = self.tokenizer.eos_token_id
+        results = []
 
-            token_probs.append(selected_prob)
-            token_log_probs.append(math.log(selected_prob + 1e-10))
-            top1_probs.append(top1_prob)
+        for b in range(batch_size):
+            gen_ids = generated_ids_batch[b]  # (n_gen,)
 
-            # Entropy: H = -sum(p * log(p + eps))
-            entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
-            token_entropies.append(entropy)
+            # Find where EOS first appears (if at all)
+            eos_positions = (gen_ids == eos_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                n_valid = eos_positions[0].item() + 1  # include EOS token
+            else:
+                n_valid = len(gen_ids)
 
-            # Top-100 logits (stored before softmax for flexibility)
-            top100 = torch.topk(logits_1d, k=100)
-            top100_logit_values.append(top100.values.cpu().float().tolist())
-            top100_logit_token_ids.append(top100.indices.cpu().tolist())
+            valid_ids = gen_ids[:n_valid]
+            tokens = self.tokenizer.convert_ids_to_tokens(valid_ids.tolist())
+            generated_answer = self.tokenizer.decode(valid_ids, skip_special_tokens=True).strip()
 
-        # --- Attention last rows ---
-        # outputs.attentions: tuple of n_gen_tokens
-        #   each: tuple of num_hidden_layers (36) tensors
-        #   each tensor: (batch=1, num_kv_heads=2, seq_len, seq_len)
-        # We store only the last row (current token's attention over all positions):
-        #   layer[0, :, -1, :] → (2, seq_len), stacked across layers → (36, 2, seq_len)
-        # seq_len grows by 1 each step, so this stays a list of arrays.
-        attention_last_rows: list[np.ndarray] = []
-        if outputs.attentions is not None:
-            for step_attns in outputs.attentions:
-                # step_attns: tuple of 36 layer tensors, each (1, 2, seq_len, seq_len)
-                stacked = np.stack(
-                    [layer[0, :, -1, :].cpu().float().numpy() for layer in step_attns],
-                    axis=0,
-                )  # (36, 2, seq_len)
-                attention_last_rows.append(stacked)
+            token_log_probs: list[float] = []
+            token_probs: list[float] = []
+            top1_probs: list[float] = []
+            token_entropies: list[float] = []
+            top100_logit_values: list[list[float]] = []
+            top100_logit_token_ids: list[list[int]] = []
 
-        # --- Hidden states ---
-        # outputs.hidden_states: tuple of n_gen_tokens
-        #   each: tuple of num_hidden_layers+1 (37) tensors, incl. embedding layer
-        #   each tensor: (batch=1, seq_len, hidden_size=2048)
-        # Mean-pool over seq_len per layer, then average across generated tokens.
-        # Final shape: (37, 2048)
-        mean_pooled_hidden_states: np.ndarray | None = None
-        if outputs.hidden_states is not None:
-            pooled_per_token: list[np.ndarray] = []
-            for step_hs in outputs.hidden_states:
-                # step_hs: tuple of 37 tensors, each (1, seq_len, 2048)
-                step_pooled = np.stack(
-                    [layer[0].mean(dim=0).cpu().float().numpy() for layer in step_hs],
-                    axis=0,
-                )  # (37, 2048)
-                pooled_per_token.append(step_pooled)
-            mean_pooled_hidden_states = np.stack(pooled_per_token, axis=0).mean(axis=0)  # (37, 2048)
+            for step_idx in range(n_valid):
+                logits_1d = outputs.scores[step_idx][b]  # (vocab_size,)
+                probs = F.softmax(logits_1d, dim=-1)
+                token_id = valid_ids[step_idx].item()
+                selected_prob = probs[token_id].item()
+                top1_prob = probs.max().item()
 
-        uncertainty_features = _compute_uncertainty(token_probs, top1_probs, token_entropies)
+                token_probs.append(selected_prob)
+                token_log_probs.append(math.log(selected_prob + 1e-10))
+                top1_probs.append(top1_prob)
 
-        return {
-            "generated_answer": generated_answer,
-            "tokens": tokens,
-            "token_log_probs": token_log_probs,
-            "top100_logit_values": top100_logit_values,
-            "top100_logit_token_ids": top100_logit_token_ids,
-            "token_entropies": token_entropies,
-            "attention_last_rows": attention_last_rows,        # list of np.ndarray, each (36, 2, seq_len)
-            "mean_pooled_hidden_states": mean_pooled_hidden_states,  # np.ndarray (37, 2048)
-            "context_start_idx": context_start_idx,
-            "context_end_idx": context_end_idx,
-            "input_len": input_len,
-            "uncertainty_features": uncertainty_features,
-        }
+                entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
+                token_entropies.append(entropy)
+
+                top100 = torch.topk(logits_1d, k=100)
+                top100_logit_values.append(top100.values.cpu().float().tolist())
+                top100_logit_token_ids.append(top100.indices.cpu().tolist())
+
+            # final_token_attention for this example: (36, 2, seq_len)
+            final_token_attn = final_attn_last_row[:, b, :, :]  # (36, 2, seq_len)
+
+            # middle_layer_hidden_state for this example: (2048,)
+            middle_hs_example = middle_hs_pooled[b]  # (2048,)
+
+            context_start_idx, context_end_idx = context_indices[b]
+            input_len = int(input_lens[b])
+
+            uncertainty_features = _compute_uncertainty(token_probs, top1_probs, token_entropies)
+
+            results.append({
+                "generated_answer": generated_answer,
+                "tokens": tokens,
+                "token_log_probs": token_log_probs,
+                "top100_logit_values": top100_logit_values,
+                "top100_logit_token_ids": top100_logit_token_ids,
+                "token_entropies": token_entropies,
+                "final_token_attention": final_token_attn,          # np.ndarray (36, 2, seq_len)
+                "middle_layer_hidden_state": middle_hs_example,     # np.ndarray (2048,)
+                "context_start_idx": context_start_idx,
+                "context_end_idx": context_end_idx,
+                "input_len": input_len,
+                "uncertainty_features": uncertainty_features,
+            })
+
+        return results
 
 
 def _compute_uncertainty(
@@ -265,28 +308,25 @@ def verify_output(record: dict) -> bool:
         print(f"[verify_output] WARNING: token_log_probs has non-negative value(s) (max={max(tlp):.4f})")
         ok = False
 
-    # attention_last_rows: list of (36, 2, seq_len) arrays
-    attn = record.get("attention_last_rows", [])
-    if not attn:
-        print("[verify_output] WARNING: attention_last_rows is empty")
+    # final_token_attention: shape (36, 2, seq_len) where seq_len > 0
+    attn = record.get("final_token_attention")
+    if attn is None:
+        print("[verify_output] WARNING: final_token_attention is None")
         ok = False
-    else:
-        for i, a in enumerate(attn):
-            if not isinstance(a, np.ndarray) or a.ndim != 3 or a.shape[0] != 36 or a.shape[1] != 2:
-                print(
-                    f"[verify_output] WARNING: attention_last_rows[{i}] has unexpected shape "
-                    f"{getattr(a, 'shape', type(a))}, expected (36, 2, seq_len)"
-                )
-                ok = False
-                break
+    elif not isinstance(attn, np.ndarray) or attn.ndim != 3 or attn.shape[0] != 36 or attn.shape[1] != 2 or attn.shape[2] == 0:
+        print(
+            f"[verify_output] WARNING: final_token_attention has unexpected shape "
+            f"{getattr(attn, 'shape', type(attn))}, expected (36, 2, seq_len>0)"
+        )
+        ok = False
 
-    # mean_pooled_hidden_states: shape (37, 2048)
-    hs = record.get("mean_pooled_hidden_states")
+    # middle_layer_hidden_state: shape (2048,)
+    hs = record.get("middle_layer_hidden_state")
     if hs is None:
-        print("[verify_output] WARNING: mean_pooled_hidden_states is None")
+        print("[verify_output] WARNING: middle_layer_hidden_state is None")
         ok = False
-    elif not isinstance(hs, np.ndarray) or hs.shape != (37, 2048):
-        print(f"[verify_output] WARNING: mean_pooled_hidden_states shape {getattr(hs, 'shape', type(hs))}, expected (37, 2048)")
+    elif not isinstance(hs, np.ndarray) or hs.shape != (2048,):
+        print(f"[verify_output] WARNING: middle_layer_hidden_state shape {getattr(hs, 'shape', type(hs))}, expected (2048,)")
         ok = False
 
     # top100_logit_values: exactly 100 entries per token
