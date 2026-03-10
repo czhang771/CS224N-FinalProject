@@ -5,7 +5,7 @@ model:
 data:
   dataset: "qiaojin/PubMedQA"
   config: "pqa_labeled"
-  n_samples: 100
+  n_samples: 5  # keep small for testing; override via CLI (--n-samples 50 / 1000)
   seed: 42
 
 generation:
@@ -16,3 +16,9 @@ generation:
 output:
   dir: "data/outputs"
   filename: "pipeline_output.jsonl"
+
+storage:
+  save_top100_logits: true
+  save_attention_matrices: true
+  save_hidden_states: true
+  attention_dtype: "float32"

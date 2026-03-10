@@ -5,11 +5,17 @@ Usage:
     # Store your Vertex service account JSON as a Modal secret (one-time setup):
     modal secret create gcp-vertex-secret SERVICE_ACCOUNT_JSON="$(cat ~/Downloads/YOUR_SERVICE_ACCOUNT_KEY.json)"
 
-    # Run the full pipeline (100 samples) on a GPU:
-    modal run modal_app.py
+    # Small test (run first):
+    modal run modal_app.py --n-samples 5
 
-    # Custom run:
-    modal run modal_app.py --n-samples 10 --seed 0 --skip-judge
+    # Medium test (run second):
+    modal run modal_app.py --n-samples 50
+
+    # Full run (only when both above look correct):
+    modal run modal_app.py --n-samples 1000
+
+    # Skip judge for generation-only testing:
+    modal run modal_app.py --n-samples 5 --skip-judge
 
     # Download output after run:
     modal volume get pipeline-outputs pipeline_output.jsonl ./data/outputs/
@@ -38,6 +44,7 @@ image = (
         "python-dotenv>=1.0.0",
         "tqdm>=4.66.0",
         "pyyaml>=6.0",
+        "numpy>=1.24.0",
     )
     # Copy local src/ into the image (replaces Mount in Modal 1.x)
     .add_local_dir("src", remote_path="/root/src")
@@ -58,7 +65,7 @@ app = modal.App("hallucination-pipeline", image=image)
 
 @app.function(
     gpu="A10G",
-    timeout=7200,  # 2 hours — enough for 100 samples
+    timeout=14400,  # 4 hours — covers 1,000 samples with attention/hidden-state logging
     secrets=[modal.Secret.from_name("gcp-vertex-secret")],
     volumes={VOLUME_PATH: volume},
 )
@@ -71,6 +78,8 @@ def run_pipeline(
 ):
     import os
     import sys
+    import numpy as np
+    import torch
     from pathlib import Path
 
     sys.path.insert(0, "/root")
@@ -127,15 +136,38 @@ def run_pipeline(
 
         # Generation
         try:
-            record.update(
-                generator.generate(
-                    question=example["question"],
-                    context_text=example["context_text"],
-                )
+            gen_result = generator.generate(
+                question=example["question"],
+                context_text=example["context_text"],
             )
+            # Convert numpy arrays to lists for JSON serialization before storing
+            if isinstance(gen_result.get("attention_last_rows"), list):
+                gen_result["attention_last_rows"] = [
+                    a.tolist() if isinstance(a, np.ndarray) else a
+                    for a in gen_result["attention_last_rows"]
+                ]
+            if isinstance(gen_result.get("mean_pooled_hidden_states"), np.ndarray):
+                gen_result["mean_pooled_hidden_states"] = gen_result["mean_pooled_hidden_states"].tolist()
+            record.update(gen_result)
         except Exception as e:
             print(f"\n  [Generator] Error on pubid={example['pubid']}: {e}")
-            record.update({"generated_answer": "", "tokens": [], "token_log_probs": [], "uncertainty_features": {}})
+            record.update({
+                "generated_answer": "",
+                "tokens": [],
+                "token_log_probs": [],
+                "top100_logit_values": [],
+                "top100_logit_token_ids": [],
+                "token_entropies": [],
+                "attention_last_rows": [],
+                "mean_pooled_hidden_states": [],
+                "context_start_idx": 0,
+                "context_end_idx": 0,
+                "input_len": 0,
+                "uncertainty_features": {},
+            })
+
+        # Free GPU memory after each example
+        torch.cuda.empty_cache()
 
         # Judge
         if judge is not None and record.get("generated_answer"):
