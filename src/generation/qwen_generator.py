@@ -156,30 +156,13 @@ class QwenGenerator:
         # The padded prompt length is inputs["input_ids"].shape[1]
         padded_input_len = inputs["input_ids"].shape[1]
 
-        # --- Final token attention: last generation step, all layers ---
-        # outputs.attentions[-1]: tuple of 36 tensors, each (batch, n_heads, seq_len, seq_len)
-        # We take the last row ([-1] in seq dim) → (batch, n_heads, seq_len)
-        # Stack across layers → (36, batch, n_heads, seq_len), then split per example
-        final_step_attns = outputs.attentions[-1]  # tuple of 36
-        # Stack: (36, batch, 2, seq_len)
-        final_attn_stacked = np.stack(
-            [layer.cpu().float().numpy() for layer in final_step_attns], axis=0
-        )  # (36, batch, 2, seq_len, seq_len)
-        # Last row of each attention matrix → (36, batch, 2, seq_len)
-        final_attn_last_row = final_attn_stacked[:, :, :, -1, :]  # (36, batch, 2, seq_len)
-
-        # --- Middle layer hidden state: layer 18, last generation step ---
-        # outputs.hidden_states[-1]: tuple of 37 tensors, each (batch, seq_len, 2048)
-        # Take layer index 18, mean-pool over seq_len → (batch, 2048)
-        final_step_hs = outputs.hidden_states[-1]  # tuple of 37
-        middle_hs = final_step_hs[18]  # (batch, seq_len, 2048)
-        middle_hs_pooled = middle_hs.mean(dim=1).cpu().float().numpy()  # (batch, 2048)
-
         # --- Per-token signals from scores ---
         # outputs.scores: tuple of n_generated, each (batch, vocab_size)
-        # We need to demux per example. Since all examples in the batch may have
-        # generated different numbers of tokens (padding stops at EOS), we track
-        # generated ids per example to know valid steps.
+        # outputs.attentions: tuple of n_generated, each a tuple of 36 layer tensors
+        #   each layer tensor: (batch, n_heads, 1, seq_len) with KV cache
+        # outputs.hidden_states: tuple of n_generated, each a tuple of 37 layer tensors
+        #   each layer tensor: (batch, 1_or_seq_len, hidden_size)
+        # All per-example signals are extracted at that example's own final valid step.
         generated_ids_batch = outputs.sequences[:, padded_input_len:]  # (batch, n_gen)
 
         # Build per-example lists of scores up to their EOS
@@ -226,11 +209,21 @@ class QwenGenerator:
                 top100_logit_values.append(top100.values.cpu().float().tolist())
                 top100_logit_token_ids.append(top100.indices.cpu().tolist())
 
-            # final_token_attention for this example: (36, 2, seq_len)
-            final_token_attn = final_attn_last_row[:, b, :, :]  # (36, 2, seq_len)
+            # final_token_attention: extract at this example's own last valid step
+            # outputs.attentions[step]: tuple of 36 tensors, each (batch, n_heads, 1, seq_len)
+            last_step = n_valid - 1
+            final_token_attn = np.stack(
+                [layer[b, :, -1, :].cpu().float().numpy()
+                 for layer in outputs.attentions[last_step]],
+                axis=0,
+            )  # (36, n_heads, seq_len)
 
-            # middle_layer_hidden_state for this example: (2048,)
-            middle_hs_example = middle_hs_pooled[b]  # (2048,)
+            # middle_layer_hidden_state: layer 18, this example's last valid step
+            # hidden_states[step][layer]: (batch, 1_or_seq, hidden_size) → mean over seq → (hidden,)
+            middle_hs_example = (
+                outputs.hidden_states[last_step][18][b]
+                .mean(dim=0).cpu().float().numpy()
+            )  # (2048,)
 
             context_start_idx, context_end_idx = context_indices[b]
             input_len = int(input_lens[b])
@@ -244,7 +237,7 @@ class QwenGenerator:
                 "top100_logit_values": top100_logit_values,
                 "top100_logit_token_ids": top100_logit_token_ids,
                 "token_entropies": token_entropies,
-                "final_token_attention": final_token_attn,          # np.ndarray (36, 2, seq_len)
+                "final_token_attention": final_token_attn,          # np.ndarray (36, 16, seq_len)
                 "middle_layer_hidden_state": middle_hs_example,     # np.ndarray (2048,)
                 "context_start_idx": context_start_idx,
                 "context_end_idx": context_end_idx,
@@ -308,15 +301,16 @@ def verify_output(record: dict) -> bool:
         print(f"[verify_output] WARNING: token_log_probs has non-negative value(s) (max={max(tlp):.4f})")
         ok = False
 
-    # final_token_attention: shape (36, 2, seq_len) where seq_len > 0
+    # final_token_attention: shape (36, 16, seq_len) where seq_len > 0
+    # Qwen2.5-3B has 36 layers and 16 attention heads
     attn = record.get("final_token_attention")
     if attn is None:
         print("[verify_output] WARNING: final_token_attention is None")
         ok = False
-    elif not isinstance(attn, np.ndarray) or attn.ndim != 3 or attn.shape[0] != 36 or attn.shape[1] != 2 or attn.shape[2] == 0:
+    elif not isinstance(attn, np.ndarray) or attn.ndim != 3 or attn.shape[0] != 36 or attn.shape[1] != 16 or attn.shape[2] == 0:
         print(
             f"[verify_output] WARNING: final_token_attention has unexpected shape "
-            f"{getattr(attn, 'shape', type(attn))}, expected (36, 2, seq_len>0)"
+            f"{getattr(attn, 'shape', type(attn))}, expected (36, 16, seq_len>0)"
         )
         ok = False
 
