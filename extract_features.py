@@ -251,7 +251,7 @@ def _judge_label_to_int(judge_label) -> int:
     s = str(judge_label).lower().strip()
     if s in ("hallucinated", "hallucination", "yes", "1", "true"):
         return 1
-    if s in ("faithful", "grounded", "no", "0", "false"):
+    if s in ("not_hallucinated", "faithful", "grounded", "no", "0", "false"):
         return 0
     return -1
 
