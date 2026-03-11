@@ -80,10 +80,11 @@ class QwenGenerator:
         Generate answers for a batch of (question, context_text) pairs.
 
         Returns a list of dicts (one per example), each containing:
-            generated_answer, tokens, token_log_probs, top100_logit_values,
-            top100_logit_token_ids, token_entropies, final_token_attention,
+            generated_answer, answer_n_tokens, tokens, token_log_probs,
+            top100_logit_values, top100_logit_token_ids, token_entropies,
+            context_attention_ratios, mean_input_attention,
             middle_layer_hidden_state, context_start_idx, context_end_idx,
-            input_len, uncertainty_features
+            padding_offset, input_len, uncertainty_features
         """
         from transformers import GenerationConfig
 
@@ -109,7 +110,10 @@ class QwenGenerator:
         # input_len per example = number of real (non-padding) tokens
         input_lens = inputs["attention_mask"].sum(dim=1).tolist()  # list of ints
 
-        # --- Context token indices (per example) ---
+        # padded_input_len is the same for all examples in the batch
+        padded_input_len = inputs["input_ids"].shape[1]
+
+        # --- Context token indices (per example, in unpadded token space) ---
         context_indices = []
         for i, (question, context_text) in enumerate(examples):
             input_text = input_texts[i]
@@ -152,21 +156,15 @@ class QwenGenerator:
                 return_dict_in_generate=True,
             )
 
-        # outputs.sequences: (batch, prompt_len_padded + n_generated)
-        # The padded prompt length is inputs["input_ids"].shape[1]
-        padded_input_len = inputs["input_ids"].shape[1]
-
-        # --- Per-token signals from scores ---
+        # outputs.sequences: (batch, padded_input_len + n_generated)
         # outputs.scores: tuple of n_generated, each (batch, vocab_size)
-        # outputs.attentions: tuple of n_generated, each a tuple of 36 layer tensors
-        #   each layer tensor: (batch, n_heads, 1, seq_len) with KV cache
-        # outputs.hidden_states: tuple of n_generated, each a tuple of 37 layer tensors
-        #   each layer tensor: (batch, 1_or_seq_len, hidden_size)
-        # All per-example signals are extracted at that example's own final valid step.
+        # outputs.attentions: tuple of n_generated, each a tuple of n_layers tensors
+        #   each layer tensor: (batch, n_heads, 1, seq_len_t) with KV cache
+        #   seq_len_t = padded_input_len + t  (grows by 1 each step)
+        # outputs.hidden_states: tuple of n_generated, each a tuple of (n_layers+1) tensors
+        #   step 0, layer: (batch, 1, hidden_size) with KV cache
         generated_ids_batch = outputs.sequences[:, padded_input_len:]  # (batch, n_gen)
 
-        # Build per-example lists of scores up to their EOS
-        # For simplicity we process scores for all steps and mask out post-EOS
         eos_id = self.tokenizer.eos_token_id
         results = []
 
@@ -184,9 +182,10 @@ class QwenGenerator:
             tokens = self.tokenizer.convert_ids_to_tokens(valid_ids.tolist())
             generated_answer = self.tokenizer.decode(valid_ids, skip_special_tokens=True).strip()
 
+            # --- Per-token scores ---
             token_log_probs: list[float] = []
             token_probs: list[float] = []
-            top1_probs: list[float] = []
+            top2_probs: list[float] = []
             token_entropies: list[float] = []
             top100_logit_values: list[list[float]] = []
             top100_logit_token_ids: list[list[int]] = []
@@ -196,11 +195,14 @@ class QwenGenerator:
                 probs = F.softmax(logits_1d, dim=-1)
                 token_id = valid_ids[step_idx].item()
                 selected_prob = probs[token_id].item()
-                top1_prob = probs.max().item()
+
+                # top2: index 0 = top-1 (selected with greedy), index 1 = runner-up
+                top2 = torch.topk(probs, k=2)
+                top2_prob = top2.values[1].item()
 
                 token_probs.append(selected_prob)
-                token_log_probs.append(math.log(selected_prob + 1e-10))
-                top1_probs.append(top1_prob)
+                token_log_probs.append(min(0.0, math.log(selected_prob + 1e-10)))
+                top2_probs.append(top2_prob)
 
                 entropy = -torch.sum(probs * torch.log(probs + 1e-10)).item()
                 token_entropies.append(entropy)
@@ -209,38 +211,68 @@ class QwenGenerator:
                 top100_logit_values.append(top100.values.cpu().float().tolist())
                 top100_logit_token_ids.append(top100.indices.cpu().tolist())
 
-            # final_token_attention: extract at this example's own last valid step
-            # outputs.attentions[step]: tuple of 36 tensors, each (batch, n_heads, 1, seq_len)
-            last_step = n_valid - 1
-            final_token_attn = np.stack(
-                [layer[b, :, -1, :].cpu().float().numpy()
-                 for layer in outputs.attentions[last_step]],
-                axis=0,
-            )  # (36, n_heads, seq_len)
-
-            # middle_layer_hidden_state: layer 18, this example's last valid step
-            # hidden_states[step][layer]: (batch, 1_or_seq, hidden_size) → mean over seq → (hidden,)
-            middle_hs_example = (
-                outputs.hidden_states[last_step][18][b]
-                .mean(dim=0).cpu().float().numpy()
-            )  # (2048,)
-
+            # --- Padding offset and padded context indices ---
             context_start_idx, context_end_idx = context_indices[b]
             input_len = int(input_lens[b])
+            padding_offset = padded_input_len - input_len
+            ctx_start_padded = context_start_idx + padding_offset
+            ctx_end_padded = context_end_idx + padding_offset
 
-            uncertainty_features = _compute_uncertainty(token_probs, top1_probs, token_entropies)
+            # --- Mean input attention + context attention ratio ---
+            # At step t, attention shape is (batch, n_heads, 1, padded_input_len + t).
+            # We keep only the first padded_input_len positions (attention to input tokens)
+            # so all steps have a consistent shape that can be averaged.
+            # context_attention_ratio: fraction of total attention (including to generated
+            # tokens) that falls on context tokens — one scalar per generated token.
+            mean_input_attn: np.ndarray | None = None  # (n_layers, n_heads, padded_input_len)
+            context_attention_ratios: list[float] = []
+
+            for step_idx in range(n_valid):
+                # step_attn_np: (n_layers, n_heads, seq_len_t)
+                step_attn_np = np.stack(
+                    [layer[b, :, -1, :].cpu().float().numpy()
+                     for layer in outputs.attentions[step_idx]],
+                    axis=0,
+                )
+
+                # Context attention ratio over full seq_len (includes generated tokens)
+                ctx_sum = step_attn_np[:, :, ctx_start_padded:ctx_end_padded].sum(axis=-1)
+                total_sum = step_attn_np.sum(axis=-1) + 1e-10
+                context_attention_ratios.append(float((ctx_sum / total_sum).mean()))
+
+                # Accumulate input-portion attention (running sum → divide at end)
+                input_attn = step_attn_np[:, :, :padded_input_len]
+                if mean_input_attn is None:
+                    mean_input_attn = input_attn.copy()
+                else:
+                    mean_input_attn += input_attn
+
+            mean_input_attn = mean_input_attn / n_valid  # (n_layers, n_heads, padded_input_len)
+
+            # --- Layer-18 hidden state: genuine mean across all generated tokens ---
+            # With KV cache, hidden_states[step][layer] has shape (batch, 1, hidden_size).
+            # Use [b, -1, :] to extract the single generated token's hidden state at each step.
+            mid_layer_hs = np.stack([
+                outputs.hidden_states[step_idx][18][b, -1, :].cpu().float().numpy()
+                for step_idx in range(n_valid)
+            ], axis=0).mean(axis=0)  # (2048,)
+
+            uncertainty_features = _compute_uncertainty(token_probs, top2_probs, token_entropies)
 
             results.append({
                 "generated_answer": generated_answer,
+                "answer_n_tokens": n_valid,
                 "tokens": tokens,
                 "token_log_probs": token_log_probs,
                 "top100_logit_values": top100_logit_values,
                 "top100_logit_token_ids": top100_logit_token_ids,
                 "token_entropies": token_entropies,
-                "final_token_attention": final_token_attn,          # np.ndarray (36, 16, seq_len)
-                "middle_layer_hidden_state": middle_hs_example,     # np.ndarray (2048,)
+                "context_attention_ratios": context_attention_ratios,   # list[float], len=n_valid
+                "mean_input_attention": mean_input_attn,                # np.ndarray (n_layers, 16, padded_input_len)
+                "middle_layer_hidden_state": mid_layer_hs,              # np.ndarray (2048,)
                 "context_start_idx": context_start_idx,
                 "context_end_idx": context_end_idx,
+                "padding_offset": padding_offset,
                 "input_len": input_len,
                 "uncertainty_features": uncertainty_features,
             })
@@ -250,7 +282,7 @@ class QwenGenerator:
 
 def _compute_uncertainty(
     token_probs: list[float],
-    top1_probs: list[float],
+    top2_probs: list[float],
     token_entropies: list[float],
 ) -> dict[str, float]:
     """Compute aggregate uncertainty features from per-token probabilities."""
@@ -270,7 +302,10 @@ def _compute_uncertainty(
     variance = sum((p - mean_p) ** 2 for p in token_probs) / n
     std_p = math.sqrt(variance)
 
-    prob_gaps = [t - s for t, s in zip(top1_probs, token_probs)]
+    # max_prob_gap: mean margin between top-1 and top-2 probability across tokens.
+    # With greedy decoding selected == top-1, so this measures decisiveness.
+    # Previously this was (top1 - selected) which is always 0 under greedy — now fixed.
+    prob_gaps = [s - t2 for s, t2 in zip(token_probs, top2_probs)]
     max_prob_gap = sum(prob_gaps) / n
 
     mean_entropy = sum(token_entropies) / len(token_entropies) if token_entropies else 0.0
@@ -292,25 +327,24 @@ def verify_output(record: dict) -> bool:
     """
     ok = True
 
-    # token_log_probs: non-empty list of negative floats
+    # token_log_probs: non-empty list of non-positive floats
     tlp = record.get("token_log_probs", [])
     if not tlp:
         print("[verify_output] WARNING: token_log_probs is empty")
         ok = False
-    elif any(v >= 0 for v in tlp):
-        print(f"[verify_output] WARNING: token_log_probs has non-negative value(s) (max={max(tlp):.4f})")
+    elif any(v > 0 for v in tlp):
+        print(f"[verify_output] WARNING: token_log_probs has positive value(s) (max={max(tlp):.8f})")
         ok = False
 
-    # final_token_attention: shape (36, 16, seq_len) where seq_len > 0
-    # Qwen2.5-3B has 36 layers and 16 attention heads
-    attn = record.get("final_token_attention")
+    # mean_input_attention: shape (n_layers, 16, padded_input_len) where all dims > 0
+    attn = record.get("mean_input_attention")
     if attn is None:
-        print("[verify_output] WARNING: final_token_attention is None")
+        print("[verify_output] WARNING: mean_input_attention is None")
         ok = False
-    elif not isinstance(attn, np.ndarray) or attn.ndim != 3 or attn.shape[0] != 36 or attn.shape[1] != 16 or attn.shape[2] == 0:
+    elif not isinstance(attn, np.ndarray) or attn.ndim != 3 or attn.shape[1] != 16 or attn.shape[2] == 0:
         print(
-            f"[verify_output] WARNING: final_token_attention has unexpected shape "
-            f"{getattr(attn, 'shape', type(attn))}, expected (36, 16, seq_len>0)"
+            f"[verify_output] WARNING: mean_input_attention has unexpected shape "
+            f"{getattr(attn, 'shape', type(attn))}, expected (n_layers, 16, padded_input_len>0)"
         )
         ok = False
 
@@ -340,6 +374,25 @@ def verify_output(record: dict) -> bool:
         ok = False
     elif any(e < 0 for e in ents):
         print("[verify_output] WARNING: some token entropy is negative")
+        ok = False
+
+    # context_attention_ratios: same length as tokens, all in [0, 1]
+    car = record.get("context_attention_ratios", [])
+    n_tokens = record.get("answer_n_tokens", len(record.get("tokens", [])))
+    if not car:
+        print("[verify_output] WARNING: context_attention_ratios is empty")
+        ok = False
+    elif len(car) != n_tokens:
+        print(f"[verify_output] WARNING: context_attention_ratios length {len(car)} != answer_n_tokens {n_tokens}")
+        ok = False
+    elif any(r < 0 or r > 1 for r in car):
+        print("[verify_output] WARNING: some context_attention_ratio is outside [0, 1]")
+        ok = False
+
+    # max_prob_gap: should be >= 0 (top1 - top2 is always non-negative)
+    gap = record.get("uncertainty_features", {}).get("max_prob_gap", -1)
+    if gap < 0:
+        print(f"[verify_output] WARNING: max_prob_gap={gap:.4f} is negative (should be >= 0)")
         ok = False
 
     # context index constraint: context_start_idx < context_end_idx < input_len

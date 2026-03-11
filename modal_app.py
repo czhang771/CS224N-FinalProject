@@ -83,6 +83,7 @@ def run_pipeline(
     max_new_tokens: int = 512,
     model_name: str = "Qwen/Qwen2.5-3B-Instruct",
     batch_size: int = 4,
+    max_samples: int = 0,  # 0 = no limit; set >0 for smoke tests
 ):
     import sys
     import numpy as np
@@ -111,6 +112,8 @@ def run_pipeline(
     if completed:
         print(f"  Resuming: {len(completed)} already completed, skipping.")
     remaining = [ex for ex in examples if str(ex["pubid"]) not in completed]
+    if max_samples > 0:
+        remaining = remaining[:max_samples]
     print(f"  {len(remaining)} examples to process.")
 
     if not remaining:
@@ -141,8 +144,8 @@ def run_pipeline(
         for ex, gen_result in zip(batch, gen_results):
             record = dict(ex)
 
-            if isinstance(gen_result.get("final_token_attention"), np.ndarray):
-                gen_result["final_token_attention"] = gen_result["final_token_attention"].tolist()
+            if isinstance(gen_result.get("mean_input_attention"), np.ndarray):
+                gen_result["mean_input_attention"] = gen_result["mean_input_attention"].tolist()
             if isinstance(gen_result.get("middle_layer_hidden_state"), np.ndarray):
                 gen_result["middle_layer_hidden_state"] = gen_result["middle_layer_hidden_state"].tolist()
 
@@ -163,15 +166,18 @@ def run_pipeline(
 def _empty_gen_result() -> dict:
     return {
         "generated_answer": "",
+        "answer_n_tokens": 0,
         "tokens": [],
         "token_log_probs": [],
         "top100_logit_values": [],
         "top100_logit_token_ids": [],
         "token_entropies": [],
-        "final_token_attention": [],
+        "context_attention_ratios": [],
+        "mean_input_attention": [],
         "middle_layer_hidden_state": [],
         "context_start_idx": 0,
         "context_end_idx": 0,
+        "padding_offset": 0,
         "input_len": 0,
         "uncertainty_features": {},
     }
@@ -290,6 +296,7 @@ def main(
     max_new_tokens: int = 512,
     model: str = "Qwen/Qwen2.5-3B-Instruct",
     batch_size: int = 4,
+    max_samples: int = 0,
 ):
     """Run generation for a training shard (0, 1, or 2)."""
     data_split = f"train_shard_{shard}"
@@ -300,6 +307,7 @@ def main(
         max_new_tokens=max_new_tokens,
         model_name=model,
         batch_size=batch_size,
+        max_samples=max_samples,
     )
     print(f"\nGeneration complete.")
     print(f"To run judge:  modal run modal_app.py::judge --shard {shard}")
