@@ -43,6 +43,7 @@ image = (
         "numpy>=1.24.0",
     )
     .add_local_dir("src", remote_path="/root/src")
+    .add_local_file("extract_features.py", remote_path="/root/extract_features.py")
 )
 
 # ---------------------------------------------------------------------------
@@ -353,6 +354,103 @@ def judge(
     print(f"Launching judge pass for split={data_split}...")
     run_judge.remote(data_split=data_split)
     print("Judge complete.")
+
+
+@app.function(
+    timeout=1800,
+    volumes={VOLUME_PATH: volume},
+)
+def run_feature_extraction(data_split: str):
+    import sys
+    import json
+    import numpy as np
+    from pathlib import Path
+
+    sys.path.insert(0, "/root")
+    from extract_features import extract_record
+
+    # Input JSONL
+    if data_split in ("val", "test"):
+        input_path = f"{VOLUME_PATH}/pipeline_output_{data_split}.jsonl"
+        output_path = f"{VOLUME_PATH}/features_{data_split}.npz"
+    else:
+        shard_idx = data_split.split("_")[-1]
+        input_path  = f"{VOLUME_PATH}/pipeline_output_train_shard{shard_idx}.jsonl"
+        output_path = f"{VOLUME_PATH}/features_train_shard{shard_idx}.npz"
+
+    volume.reload()
+    records = []
+    with open(input_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                records.append(json.loads(line))
+    print(f"Loaded {len(records)} records from {input_path}")
+
+    all_scalars, all_hidden, all_labels, all_pubids = [], [], [], []
+    feature_names = None
+    n_skipped = 0
+
+    for i, record in enumerate(records):
+        try:
+            scalar, hidden, label, pubid = extract_record(record)
+        except Exception as e:
+            print(f"  WARNING: skipping record {i} (pubid={record.get('pubid')}): {e}")
+            n_skipped += 1
+            continue
+        if feature_names is None:
+            feature_names = list(scalar.keys())
+        all_scalars.append(list(scalar.values()))
+        all_hidden.append(hidden)
+        all_labels.append(label)
+        all_pubids.append(pubid)
+
+    X        = np.array(all_scalars, dtype=np.float32)
+    X_hidden = np.array(all_hidden,  dtype=np.float32)
+    y        = np.array(all_labels,  dtype=np.int32)
+    pubids   = np.array(all_pubids,  dtype=object)
+
+    np.savez_compressed(
+        output_path,
+        scalar_features=X,
+        hidden_states=X_hidden,
+        y=y,
+        pubids=pubids,
+        feature_names=np.array(feature_names, dtype=object),
+    )
+    volume.commit()
+
+    label_counts = {int(k): int(v) for k, v in zip(*np.unique(y, return_counts=True))}
+    print(f"Done. {len(all_scalars)} extracted, {n_skipped} skipped.")
+    print(f"  scalar_features={X.shape}  hidden_states={X_hidden.shape}")
+    print(f"  Labels — hallucinated(1): {label_counts.get(1,0)}, faithful(0): {label_counts.get(0,0)}, unknown(-1): {label_counts.get(-1,0)}")
+    print(f"  Saved: {output_path}")
+
+
+@app.local_entrypoint()
+def extract(
+    shard: int = -1,
+    split: str = "",
+):
+    """Extract features from a judged shard or eval split into a compact .npz on the volume.
+
+    Usage:
+        modal run modal_app.py::extract --shard 0   # train shard
+        modal run modal_app.py::extract --split val  # val/test split
+    """
+    if split in ("val", "test"):
+        data_split = split
+    elif shard >= 0:
+        data_split = f"train_shard_{shard}"
+    else:
+        raise ValueError("Provide --shard 0/1/2 or --split val/test")
+    print(f"Extracting features for split={data_split}...")
+    run_feature_extraction.remote(data_split=data_split)
+    if split in ("val", "test"):
+        fname = f"features_{split}.npz"
+    else:
+        fname = f"features_train_shard{shard}.npz"
+    print(f"Done. To download: modal volume get pipeline-outputs {fname} ./data/features/")
 
 
 @app.local_entrypoint()
