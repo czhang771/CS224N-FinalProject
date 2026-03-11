@@ -47,6 +47,19 @@ image = (
     .add_local_file("extract_features_v2.py", remote_path="/root/extract_features_v2.py")
 )
 
+# Lightweight image for ablation (no GPU needed)
+ablation_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .pip_install(
+        "numpy>=1.24.0",
+        "scikit-learn>=1.3.0",
+        "pandas>=2.0.0",
+        "matplotlib>=3.7.0",
+    )
+    .add_local_file("results/v3/ablation_study_v3.py", remote_path="/root/ablation_study_v3.py")
+    .add_local_file("results/v4/ablation_study_v4.py", remote_path="/root/ablation_study_v4.py")
+)
+
 # ---------------------------------------------------------------------------
 # Persistent volume
 # ---------------------------------------------------------------------------
@@ -560,3 +573,128 @@ def merge():
     run_merge.remote()
     print(f"Merge complete.")
     print(f"To download: modal volume get pipeline-outputs {MERGED_FILENAME} ./data/outputs/")
+
+
+# ---------------------------------------------------------------------------
+# Ablation study v3
+# ---------------------------------------------------------------------------
+@app.function(
+    image=ablation_image,
+    timeout=1800,
+    volumes={VOLUME_PATH: volume},
+)
+def run_ablation_v3():
+    import os
+    import shutil
+    import subprocess
+
+    volume.reload()
+
+    # Copy feature files from volume to a local temp dir accessible to the script
+    tmp_data = "/tmp/features"
+    os.makedirs(tmp_data, exist_ok=True)
+    for fname in ("features_v2_train_all.npz", "features_v2_val.npz", "features_v2_test.npz"):
+        src = f"{VOLUME_PATH}/{fname}"
+        dst = f"{tmp_data}/{fname}"
+        if not os.path.exists(dst):
+            shutil.copy2(src, dst)
+            print(f"Copied {fname}")
+
+    tmp_out = "/tmp/ablation_out"
+    os.makedirs(tmp_out, exist_ok=True)
+
+    env = os.environ.copy()
+    env["FEATURE_DATA_DIR"] = tmp_data
+    env["ABLATION_OUT_DIR"] = tmp_out
+
+    import subprocess
+    subprocess.run(["python", "/root/ablation_study_v3.py"], check=True, env=env)
+
+    # Persist outputs back to volume
+    for fname in os.listdir(tmp_out):
+        src = os.path.join(tmp_out, fname)
+        dst = f"{VOLUME_PATH}/ablation_v3_{fname}"
+        shutil.copy2(src, dst)
+        print(f"Saved to volume: ablation_v3_{fname}")
+    volume.commit()
+
+
+@app.local_entrypoint()
+def ablation_v3():
+    """Run ablation study v3 on Modal (CPU only).
+
+    Usage:
+        modal run modal_app.py::ablation_v3
+
+    Download results:
+        modal volume get pipeline-outputs ablation_v3_results_ablation_v3.csv ./results/v3/
+        modal volume get pipeline-outputs ablation_v3_roc_curves_v3.png ./results/v3/
+        modal volume get pipeline-outputs ablation_v3_pr_curves_v3.png ./results/v3/
+    """
+    print("Launching ablation study v3 on Modal...")
+    run_ablation_v3.remote()
+    print("\nDone. Download results with:")
+    print("  modal volume get pipeline-outputs ablation_v3_results_ablation_v3.csv ./results/v3/")
+    print("  modal volume get pipeline-outputs ablation_v3_roc_curves_v3.png ./results/v3/")
+    print("  modal volume get pipeline-outputs ablation_v3_pr_curves_v3.png ./results/v3/")
+
+
+# ---------------------------------------------------------------------------
+# Ablation study v4 (PCA on hidden states)
+# ---------------------------------------------------------------------------
+@app.function(
+    image=ablation_image,
+    timeout=1800,
+    volumes={VOLUME_PATH: volume},
+)
+def run_ablation_v4():
+    import os
+    import shutil
+    import subprocess
+
+    volume.reload()
+
+    tmp_data = "/tmp/features"
+    os.makedirs(tmp_data, exist_ok=True)
+    for fname in ("features_v2_train_all.npz", "features_v2_val.npz", "features_v2_test.npz"):
+        src = f"{VOLUME_PATH}/{fname}"
+        dst = f"{tmp_data}/{fname}"
+        if not os.path.exists(dst):
+            shutil.copy2(src, dst)
+            print(f"Copied {fname}")
+
+    tmp_out = "/tmp/ablation_out_v4"
+    os.makedirs(tmp_out, exist_ok=True)
+
+    env = os.environ.copy()
+    env["FEATURE_DATA_DIR"] = tmp_data
+    env["ABLATION_OUT_DIR"] = tmp_out
+
+    subprocess.run(["python", "/root/ablation_study_v4.py"], check=True, env=env)
+
+    for fname in os.listdir(tmp_out):
+        src = os.path.join(tmp_out, fname)
+        dst = f"{VOLUME_PATH}/ablation_v4_{fname}"
+        shutil.copy2(src, dst)
+        print(f"Saved to volume: ablation_v4_{fname}")
+    volume.commit()
+
+
+@app.local_entrypoint()
+def ablation_v4():
+    """Run PCA ablation study (v4) on Modal (CPU only).
+
+    Usage:
+        modal run modal_app.py::ablation_v4
+
+    Download results:
+        modal volume get pipeline-outputs ablation_v4_results_ablation_v4.csv ./results/v4/
+        modal volume get pipeline-outputs ablation_v4_pca_auc_v4.png ./results/v4/
+        modal volume get pipeline-outputs ablation_v4_roc_curves_v4.png ./results/v4/
+    """
+    print("Launching PCA ablation study v4 on Modal...")
+    run_ablation_v4.remote()
+    print("\nDone. Download results with:")
+    print("  modal volume get pipeline-outputs ablation_v4_results_ablation_v4.csv ./results/v4/")
+    print("  modal volume get pipeline-outputs ablation_v4_pca_auc_v4.png ./results/v4/")
+    print("  modal volume get pipeline-outputs ablation_v4_roc_curves_v4.png ./results/v4/")
